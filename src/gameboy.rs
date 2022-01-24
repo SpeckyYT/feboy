@@ -23,6 +23,7 @@ pub struct Gameboy {
     pub mem: MemoryMap,
     pub halted: bool,
     bugged_pc: Option<WordRegister>,
+    current_command: Command,
 }
 
 impl Gameboy {
@@ -33,6 +34,7 @@ impl Gameboy {
             ei_counter: -1,
             ime: false,
             halted: false,
+            current_command: NOP,
             bugged_pc: None,
         }
     }
@@ -42,7 +44,6 @@ impl Gameboy {
     #[deny(unreachable_patterns)]
     pub fn cycle(&mut self) -> u8 {
         let interrupt_cycles = if self.handle_interrupts() { 5 } else { 0 };
-
         if self.halted {
             self.halted = interrupt_cycles == 0;
             if self.halted && !self.ime {
@@ -61,6 +62,7 @@ impl Gameboy {
 
         let instruction = InstructionFetcher::fetch_instruction(self.reg.pc.value(), &self.reg, &mut self.mem);
         let (opcode, command) = (instruction.0, instruction.1);
+        self.current_command = command;
         let line = self.mem.ppu.ly();
         let _log = format!("op:0x{:02x}|pc:{}|sp:{}|a:{}|b:{}|c:{}|d:{}|e:{}|h:{}|l:{}|f:{}|ly:{}|lt:{}", opcode, self.reg.pc.value() + 1, self.reg.sp.value(), self[A].value, self[B].value, self[C].value, self[D].value, self[E].value, self[H].value, self[L].value, self.reg.flags.value(), line, self.mem.ppu.last_ticks);
         //println!("{}", log);
@@ -89,7 +91,7 @@ impl Gameboy {
         if !self.ime && self.halted && self.mem.read_without_cycle(IE_ADDRESS as u16) & self.mem.read_without_cycle(IF_ADDRESS as u16) & 0x1F != 0 {
             self.halted = false;
             self.bugged_pc = Some(self.reg.pc);
-            let x = self.mem.read(self.reg.pc);
+            let x = self.read(self.reg.pc);
             self.mem.memory.insert(self.reg.pc.value() as usize, x);
         }
         if command != HALT { command_cycles } else {
@@ -97,11 +99,16 @@ impl Gameboy {
         }
     }
 
+    fn read<T: 'static + Into<usize> + Copy>(&mut self, address: T) -> u8 {
+        println!("{:?}", self.current_command);
+        self.mem.read(address)
+    }
+
     fn get_op(&mut self, op: InstructionOperand) -> u8 {
         match op {
             OpByte(n) => n,
             OpRegister(id) => self[id].value,
-            OpHL => self.mem.read(self.reg.hl())
+            OpHL => self.read(self.reg.hl())
         }
     }
 
@@ -229,26 +236,26 @@ impl Gameboy {
             }
 
             DECH_HL => {
-                let old = self.mem.read(hl);
+                let old = self.read(hl);
                 self.mem.write(hl, old.wrapping_sub(1));
                 let hc = half_carry_8_sub(old, 1, 0);
                 self.reg.set_flags(old.wrapping_sub(1) == 0, true, hc, self.reg.flags.c);
             }
 
             INCH_HL => {
-                let old = self.mem.read(hl);
+                let old = self.read(hl);
                 self.mem.write(hl, old.wrapping_add(1));
                 let hc = half_carry_8_add(old, 1, 0);
                 self.reg.set_flags(old.wrapping_add(1) == 0, false, hc, self.reg.flags.c);
             }
 
             DEC_R16(reg) => {
-                self.mem.trigger_oam_inc_dec_corruption(reg);
+                self.mem.ppu.trigger_pre_corruption(reg.value() as usize, self.current_command);
                 self.set_word_register_with_micro_cycle(reg.value().wrapping_sub(1), reg)
             }
 
             INC_R16(reg) => {
-                self.mem.trigger_oam_inc_dec_corruption(reg);
+                self.mem.ppu.trigger_pre_corruption(reg.value() as usize, self.current_command);
                 self.set_word_register_with_micro_cycle(reg.value().wrapping_add(1), reg)
             },
 
@@ -316,14 +323,14 @@ impl Gameboy {
             }
 
             RES_U3_HL(bit) => {
-                let x = self.mem.read(hl);
+                let x = self.read(hl);
                 self.mem.write(hl, x & !bit.0)
             }
 
             SET_U3_R8(bit, id) => self[id].value |= bit.0,
 
             SET_U3_HL(bit) => {
-                let x = self.mem.read(hl);
+                let x = self.read(hl);
                 self.mem.write(hl, x | bit.0)
             }
 
@@ -333,7 +340,7 @@ impl Gameboy {
             }
 
             SWAP_HL => {
-                let x = self.mem.read(hl);
+                let x = self.read(hl);
                 self.mem.write(hl, x.rotate_left(4));
                 self.reg.set_flags(x == 0, false, false, false);
             }
@@ -345,32 +352,32 @@ impl Gameboy {
             LD_R8_U8(a, b) => self[a].value = b,
             LD_R16_U16(a, b) => self.set_word_register(b, a),
             LD_HL_R8(id) => { self.mem.write(hl, self[id].value); }
-            LD_R8_HL(id) => { self[id].value = self.mem.read(hl) }
+            LD_R8_HL(id) => { self[id].value = self.read(hl) }
             LD_R16_A(n) => self.mem.write(n, self[A]),
             LDH_U16_A(n) => self.mem.write(n, self[A]),
             LDH_C_A => self.mem.write(self[C], self[A]),
             LD_A_U8(n) => { self[A].value = n }
-            LD_A_R16(n) => self[A].value = self.mem.read(n),
-            LDH_A_U16(n) => self[A].value = self.mem.read(n),
+            LD_A_R16(n) => self[A].value = self.read(n),
+            LDH_A_U16(n) => self[A].value = self.read(n),
             LDH_A_U8(n) => {
-                let x = self.mem.read(n);
+                let x = self.read(n);
                 self[A].value = x;
             }
             LDH_U8_A(n) => {
                 self.mem.write(n, self[A].value)
             }
             LDH_HL_U8(n) => self.mem.write(hl, n),
-            LDH_A_C => self[A].value = self.mem.read(self[C]),
+            LDH_A_C => self[A].value = self.read(self[C]),
             LD_A_HLD => {
                 self.set_word_register(hl.value().wrapping_sub(1), self.reg.hl());
-                self[A].value = self.mem.read(hl);
+                self[A].value = self.read(hl);
             }
             LD_HLD_A => {
                 self.set_word_register(hl.value().wrapping_sub(1), self.reg.hl());
                 self.mem.write(hl, self[A]);
             }
             LD_A_HLI => {
-                self[A].value = self.mem.read(hl);
+                self[A].value = self.read(hl);
                 self.set_word_register(hl.value().wrapping_add(1), self.reg.hl());
             }
             LD_HLI_A => {
@@ -395,14 +402,14 @@ impl Gameboy {
                 self.reg.set_flags(self.reg.flags.z, true, true, self.reg.flags.c);
             }
             RET => {
-                let lo = self.mem.read(self.reg.sp);
-                let hi = self.mem.read(self.reg.sp.value().wrapping_add(1));
+                let lo = self.read(self.reg.sp);
+                let hi = self.read(self.reg.sp.value().wrapping_add(1));
                 self.set_pc(u16::from_le_bytes([lo, hi]), true);
                 self.set_word_register(self.reg.sp.value().wrapping_add(2), self.reg.sp);
             }
             RETI => {
-                let lo = self.mem.read(self.reg.sp);
-                let hi = self.mem.read(self.reg.sp.value().wrapping_add(1));
+                let lo = self.read(self.reg.sp);
+                let hi = self.read(self.reg.sp.value().wrapping_add(1));
                 self.set_pc(u16::from_le_bytes([lo, hi]), true);
                 self.set_word_register(self.reg.sp.value().wrapping_add(2), self.reg.sp);
                 self.ei_counter = 1;
@@ -436,13 +443,14 @@ impl Gameboy {
                 match reg {
                     WordRegister::Double(ByteRegister { value: _, id: high }, ByteRegister { value: _, id: low }) => {
                         for id in &[low, high] {
-                            self[*id].value = self.mem.read(self.reg.sp);
+                            self[*id].value = self.read(self.reg.sp);
                             self.set_word_register(self.reg.sp.value().wrapping_add(1), self.reg.sp);
                         }
                     }
                     WordRegister::AccFlag(..) => {
-                        self.reg.flags.set(self.mem.read(self.reg.sp));
-                        self[A].value = self.mem.read(self.reg.sp.value().wrapping_add(1));
+                        let f = self.read(self.reg.sp);
+                        self.reg.flags.set(f);
+                        self[A].value = self.read(self.reg.sp.value().wrapping_add(1));
                         self.set_word_register(self.reg.sp.value().wrapping_add(2), self.reg.sp);
                     }
 
@@ -504,8 +512,8 @@ impl Gameboy {
 
             RET_CC(cc) => {
                 if self.reg.cc_flag(cc) {
-                    let lo = self.mem.read(self.reg.sp);
-                    let hi = self.mem.read(self.reg.sp.value().wrapping_add(1));
+                    let lo = self.read(self.reg.sp);
+                    let hi = self.read(self.reg.sp.value().wrapping_add(1));
                     self.set_pc(u16::from_le_bytes([lo, hi]), false);
                     self.set_word_register(self.reg.sp.value().wrapping_add(2), self.reg.sp);
                 } else {
@@ -537,9 +545,11 @@ impl Gameboy {
     }
 
     fn set_pc(&mut self, value: u16, trigger_cycle: bool) {
+        if trigger_cycle {
+            self.mem.ppu.trigger_pre_corruption(self.reg.pc.value() as usize, self.current_command);
+        }
         self.reg.pc = ProgramCounter(value);
         if trigger_cycle {
-            self.mem.trigger_oam_inc_dec_corruption(self.reg.pc.value());
             self.micro_cycle()
         }
     }

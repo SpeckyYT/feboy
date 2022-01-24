@@ -8,8 +8,11 @@ use crate::ppu::ObjSize::{StackedTile, SingleTile};
 use crate::ppu::AddressingMode::{H8800, H8000};
 use crate::ppu::RenderCycle::{Normal, StatTrigger};
 use minifb::{WindowOptions, Window, ScaleMode, Scale};
+use Command::INC_R16;
 use DmaState::{Starting, Executing, Finished};
 use OamCorruptionCause::{IncDec, Read, ReadWrite, Write};
+use crate::instruction::Command;
+use crate::instruction::Command::{DEC_R16, DEC_R8};
 use crate::memory_map::OamCorruptionCause;
 use crate::ppu::DmaState::Inactive;
 
@@ -51,6 +54,11 @@ pub struct PPU {
     pub last_ticks: usize,
     pub old_mode: PpuMode,
     pub last_lyc_check: bool,
+    // Inc/Dec OAM corruptions should occur before the read/write corruptions
+    // Then we should be able to determine whether to execute a R/W/RW
+    // Since Inc/Dec + Write == Write == WriteCorruption, we only need to handle
+    // Inc/Dec + Read = ReadWrite corruption
+    oam_pre_corrupted: Option<Command>
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -112,11 +120,12 @@ impl PPU {
             old_mode: HBlank,
             dma: Inactive,
             last_lyc_check: false,
+            oam_pre_corrupted: None,
             window,
         }
     }
 
-    pub fn machine_cycle(&mut self, oam_corruption: &Option<OamCorruptionCause>) -> RenderCycle {
+    pub fn machine_cycle(&mut self) -> RenderCycle {
         self.old_mode = self.mode;
         self.ticks += 4;
 
@@ -138,7 +147,12 @@ impl PPU {
 
         self.ticks -= match self.mode {
             OamSearch => if self.ticks < 80 {
-                self.handle_oam_corruption(oam_corruption);
+                if let Some(command) = self.oam_pre_corrupted {
+                    if let INC_R16(..) | DEC_R16(..) = command {
+                        // Inc/Dec corruption
+                        self.handle_oam_write_corruption();
+                    }
+                }
                 0
             } else {
                 self.mode = PixelTransfer;
@@ -178,9 +192,9 @@ impl PPU {
         } else {
             self.state = if self.old_mode == self.mode { ProcessingMode(self.mode) } else { ModeChange(self.old_mode, self.mode) };
         }
-        let ret = self.cycle_result(self.old_mode);
+        self.oam_pre_corrupted = None;
         //println!("STAT: {} | LYC: {} | LY: {}", self.stat(), self.lyc(), self.ly());
-        ret
+        self.cycle_result(self.old_mode)
     }
 
     fn cycle_result(&mut self, old_mode: PpuMode) -> RenderCycle {
@@ -205,6 +219,13 @@ impl PPU {
         ]
     }
 
+    pub fn trigger_pre_corruption(&mut self, address: usize, command: Command) {
+        if (0xFE00_usize..0xFEFF_usize).contains(&address) {
+            println!("PRE-CORRUPTING: {:?}", command);
+            self.oam_pre_corrupted = Some(command);
+        }
+    }
+
     pub fn read(&mut self, address: usize) -> Option<u8> {
         match (address, self.mode, self.dma) {
             (0x8000..=0x9FFF, PixelTransfer, _) => Some(0xFF),
@@ -218,10 +239,20 @@ impl PPU {
             (0xFE00..=0xFE9F, VBlank | HBlank, Inactive | Starting) => {
                 Some(self.oam[address - 0xFE00])
             }
-            (0xFE00..=0xFE9F, ..) => {
-                self.handle_oam_read_corruption();
+
+            // OAM Read/ReadWrite corrutpion
+            (0xFE00..=0xFEFF, OamSearch, ..) => {
+                if None != self.oam_pre_corrupted {
+                    print!("RW CORRUPTION");
+                    self.handle_oam_read_write_corruption();
+                } else {
+                    print!("R CORRUPTION");
+                    self.handle_oam_read_corruption();
+                }
                 Some(0xFF)
             }
+
+            (0xFE00..=0xFE9F, ..) => Some(0xFF),
 
             (0xFF40, ..) => Some(self.lcdc.get()),
             (0xFF41, ..) => Some(self.stat()),
@@ -240,7 +271,14 @@ impl PPU {
             (0x9C00..=0x9FFF, ..) => self.tile_map_b[address - 0x9C00] = value,
 
             (0xFE00..=0xFE9F, HBlank | VBlank, Inactive | Starting) => self.oam[address - 0xFE00] = value,
-            (0xFE00..=0xFE9F, ..) => self.handle_oam_write_corruption(),
+
+            // OAM Write corruption
+            (0xFE00..=0xFEFF, OamSearch, ..) => {
+                print!("W CORRUPTION");
+                self.handle_oam_write_corruption()
+            },
+
+            (0xFEA0..=0xFEFF, ..) => (),
 
             (0xFF40, ..) => {
                 self.lcdc.set(value)
@@ -466,14 +504,6 @@ impl PPU {
         self.pixels[offset] = u32::from_be_bytes([color.a, color.r, color.g, color.b]);
     }
 
-    fn handle_oam_corruption(&mut self, oam_corruption: &Option<OamCorruptionCause>) {
-        match oam_corruption {
-            Some(IncDec | Write) => self.handle_oam_write_corruption(),
-            Some(Read) => self.handle_oam_read_corruption(),
-            Some(ReadWrite) => self.handle_oam_read_write_corruption(),
-            None => ()
-        }
-    }
     fn handle_oam_read_write_corruption(&mut self) {
         todo!()
     }
@@ -487,9 +517,11 @@ impl PPU {
     }
 
     fn handle_oam_pattern_corruption(&mut self, pattern: fn(u16, u16, u16) -> u16) {
-        println!("Ticks: {}", self.ticks);
-        let oam_row = min(19, self.ticks / 4);
-        println!("Row: {:?}", oam_row);
+        println!("CORRUPTION REASON: {:?}", self.oam_pre_corrupted);
+
+        let oam_row = (self.ticks / 4) - 1;
+
+        if oam_row == 0 { return; }
 
         let mut rows = self.oam.chunks_mut(8);
 

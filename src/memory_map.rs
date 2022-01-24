@@ -30,8 +30,7 @@ pub struct MemoryMap {
     rom_size: usize,
     rom_name: String,
     pub cycles: u16,
-    dma_progress: usize,
-    oam_corruption: Option<OamCorruptionCause>
+    dma_progress: usize
 }
 
 impl MemoryMap {
@@ -43,28 +42,10 @@ impl MemoryMap {
         let rom_size = rom.len() as usize;
         let rom_name = rom_name.to_owned();
         let memory = vec![0; 0x10000];
-        let micro_ops = 0;
+        let cycles = 0;
         let dma_progress = 0;
-        let oam_corruption = None;
-        let mem = MemoryMap { joypad, ppu, interrupt_handler, timer, memory, rom_name, rom_size, cycles: micro_ops, dma_progress, oam_corruption };
+        let mem = MemoryMap { joypad, ppu, interrupt_handler, timer, memory, rom_name, rom_size, cycles, dma_progress };
         MemoryMap::init_memory(mem, rom)
-    }
-
-    fn in_oam<T: 'static + Into<usize> + Copy>(&self, address: T) -> bool {
-        let translated_address = if address.type_id() == TypeId::of::<u8>() { address.into() + 0xFF00 } else { address.into() };
-        if address.type_id() == TypeId::of::<WordRegister>() {
-            return (0xFE00_usize..=0xFEFF_usize).contains(&translated_address);
-        } else {
-            return (0xFE00_usize..=0xFEFF_usize).contains(&translated_address);
-        }
-    }
-
-    pub fn trigger_oam_inc_dec_corruption<T: 'static + Into<usize> + Copy>(&mut self, address: T) {
-        if !self.in_oam(address) { return; }
-        self.oam_corruption = match self.oam_corruption {
-            None => Some(IncDec),
-            _ => panic!()
-        }
     }
 
     pub fn read<T: 'static + Into<usize> + Copy>(&mut self, address: T) -> u8 {
@@ -107,8 +88,10 @@ impl MemoryMap {
     }
 
     fn dma_transfer(&mut self) {
+        // TODO: Can DMA transfer trigger OAM corruption?
         if let Inactive | Starting = self.ppu.dma { return; }
         while self.dma_progress < self.ppu.dma_progress {
+            println!("DMA_READ + ");
             self.ppu.oam[self.dma_progress] = self.read_without_cycle(self.ppu.dma_offset * 0x100 + self.dma_progress);
             self.dma_progress += 1;
         }
@@ -119,7 +102,7 @@ impl MemoryMap {
 
     fn machine_cycle(&mut self) {
         let mut interrupts = vec![];
-        interrupts.append(&mut match self.ppu.machine_cycle(&self.oam_corruption) {
+        interrupts.append(&mut match self.ppu.machine_cycle() {
             StatTrigger(ModeChange(_, VBlank)) => vec![VBlankInt, StatInt],
             Normal(ModeChange(_, VBlank)) => vec![VBlankInt],
             StatTrigger(_) => vec![StatInt],
@@ -132,7 +115,6 @@ impl MemoryMap {
 
         interrupts.append(&mut self.joypad.machine_cycle(&self.ppu.window).iter().map(|_| JoypadInt).collect());
 
-        self.oam_corruption = None;
         self.interrupt_handler.set(interrupts, true);
     }
 
